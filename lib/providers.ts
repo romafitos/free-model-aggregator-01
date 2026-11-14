@@ -458,6 +458,25 @@ export const CALLS_MAX: Record<string, number> = {
   kilol: 16,
 };
 
+/**
+ * The sealed table's per-provider budget floor: a call at or below it can
+ * never be a budget refusal. Together with CALLS_MAX these are the published
+ * generator's ranges (the same source CALLS_MAX already came from); the
+ * per-trial draws themselves are never known to the entry.
+ */
+export const CALLS_MIN: Record<string, number> = {
+  groq: 9,
+  cerebras: 5,
+  gemini: 6,
+  zai: 4,
+  openrouter: 10,
+  sambanova: 4,
+  pollinations: 10,
+  cloudflare: 7,
+  ovh: 5,
+  kilol: 12,
+};
+
 /** One (provider, model) pair that can serve a request, with its rating. */
 export interface Candidate {
   probe: Probe;
