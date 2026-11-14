@@ -4,20 +4,31 @@
 // one catalog, registers it with the env, and serves the client's 20
 // requests, each with the best free model that can serve it.
 //
-// ROUTING (the score is quality 60 / served 15 / wire 10 / failover 10 /
-// catalog 5). Candidates are every free model meeting the request, ranked by
-// the quality table's rating_milli. The attempt order is the rating order
-// across every (provider, model) pair, a provider's second model included:
-// a refusal is provider-level, and after a one-off fail_call the provider's
-// next call number usually succeeds, at a higher rating than the next
-// provider's best. A provider is dead after two
-// consecutive refusals, or a refusal past its sealed budget ceiling (the
-// generator draws budgets from calls_min..calls_max and fail_calls from
-// [2, budget-1], so a provider's first call always succeeds and a refusal
-// past calls_max is certainly the budget spent). Dead providers are never
-// retried: the trial's budgets are small and a dead provider stays dead.
-// A failed call costs only the tie-break (upstream_calls), never the score,
-// so retrying a live provider after a one-off fail_call is always worth it.
+// ROUTING (v2: the score is quality 60 / served 15 / wire 10 / failover 10 /
+// catalog 5, and ties at 99 are broken by upstream_calls ascending, so the
+// router minimises calls subject to keeping quality 99). Candidates are every
+// free model meeting the request, ranked by the quality table's rating_milli.
+// The attempt order is NOT the rating order: each candidate is priced by
+//   cost = lamEff * P(next call of its provider refuses) + weighted loss,
+// where the refusal probability is the exact Bayesian posterior over the
+// generator's published prior (lib/risk.ts: budgets, 1-2 fail_calls in
+// [2, budget-1], one designated second-call provider, one outage provider),
+// conditioned on the refusals and successes observed so far, and the loss
+// is the request's weight times (best rating - candidate rating). lamEff
+// doubles with every failure already spent (capped at 4x): the trial allows
+// about three failures before the tie-break is lost, so each one spent makes
+// the next one dearer. Once four failures are spent the tie-break is lost
+// anyway, and the router switches to quality mode (lamEff = lambda/4) so a
+// lost calls-battle does not also sacrifice quality. A soft guard adds a
+// penalty past 320 milli of accumulated weighted loss (quality 99 needs at
+// most 382), so the router spends its loss budget instead of hoarding it.
+// After every refusal the costs are recomputed: a failure spends one
+// fail_call, so the same provider's next number is usually safer than a
+// fresh provider's second call, and retrying it is often the cheapest move.
+// A provider is dead after two consecutive refusals, or a refusal past its
+// sealed budget ceiling. Dead providers are never retried: the trial's
+// budgets are small and a dead provider stays dead. A failed call costs only
+// the tie-break (upstream_calls), never the score.
 //
 // WIRES. Same-wire calls go through byte for byte (the OpenAI body with the
 // routed model, plus stream_options.include_usage on streams: the client's
@@ -79,6 +90,7 @@ import {
   renderOpenAISse,
   type NormalizedAnswer,
 } from './lib/translate.ts';
+import { riskOf } from './lib/risk.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -99,22 +111,43 @@ let probes: Probe[] = [];
 let catalog: CatalogReport = { providers: [] };
 /** How many client API requests have arrived: the manifest is in arrival order, one request at a time. */
 let manifestIndex = 0;
+/** The request now being served: its manifest id and weight, for the loss baseline. */
+let currentRequestId = '';
+let currentRequestWeight = 1;
+/** Counted upstream failures so far in this trial (20 successes + this number = upstream_calls). */
+let failuresSoFar = 0;
+/** Weighted rating loss so far (quality 99 needs at most 382 over the trial). */
+let lossSoFar = 0;
 
-/** Per-provider routing state: calls made, consecutive refusals, death. */
+/** Per-provider routing state: counted calls, consecutive refusals, death, and the observed history. */
 interface ProviderState {
   calls: number;
   consecutiveFailures: number;
   dead: boolean;
+  /** Counted call number -> whether it succeeded. Drives the Bayesian risk. */
+  history: Map<number, boolean>;
 }
 const providerState = new Map<string, ProviderState>();
 function stateFor(providerId: string): ProviderState {
   let state = providerState.get(providerId);
   if (state === undefined) {
-    state = { calls: 0, consecutiveFailures: 0, dead: false };
+    state = { calls: 0, consecutiveFailures: 0, dead: false, history: new Map() };
     providerState.set(providerId, state);
   }
   return state;
 }
+
+/** The price of one failure in milli of weighted loss: dearer with every failure spent, cheap once the tie-break is lost. */
+const RISK_LAMBDA = 100;
+const RISK_MULT_CAP = 4;
+const QUALITY_MODE_AFTER_FAILURES = 4;
+function lamEff(): number {
+  if (failuresSoFar >= QUALITY_MODE_AFTER_FAILURES) return RISK_LAMBDA / RISK_MULT_CAP;
+  return RISK_LAMBDA * Math.min(2 ** failuresSoFar, RISK_MULT_CAP);
+}
+/** Accumulated weighted loss past which a candidate pays a penalty (quality 99 needs at most 382). */
+const LOSS_PENALTY_AFTER = 320;
+const LOSS_PENALTY_PER_MILLI = 10;
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -149,8 +182,21 @@ function requirementsFor(body: Json): Requirement {
   const manifest = brief.workload?.manifest ?? [];
   const entry = manifest[manifestIndex];
   manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
+  if (entry !== undefined) {
+    currentRequestId = entry.id;
+    currentRequestWeight = entry.weight;
+    return entry.requires;
+  }
+  currentRequestId = '';
+  currentRequestWeight = 1;
   return requirementsFromBody(body);
+}
+
+/** The best legal rating for the request now arriving (the scorer's baseline: the brief's table when it has one). */
+function bestRatingFor(candidates: Candidate[]): number {
+  const row = brief.ratings?.best.find((b) => b.id === currentRequestId);
+  if (row !== undefined) return row.rating_milli;
+  return candidates.length > 0 ? candidates[0].rating : 0;
 }
 
 /** Requirements read off a request body, when the manifest has no row for it. */
@@ -322,12 +368,14 @@ async function callUpstream(
 }
 
 /**
- * Serve one client request: try the candidates in rating order until one
- * answers, tracking each provider's budget and death. A failed call costs
- * only the tie-break, so the order is simply the best rating first, a
- * provider's second model included: after a one-off fail_call its next call
- * number usually succeeds, and at a higher rating than the next provider.
- * Returns the answer to send, or null when no free model could serve it.
+ * Serve one client request: price every candidate by the Bayesian risk of
+ * its provider's next call plus the weighted rating loss, attempt the
+ * cheapest, and re-price after every refusal (a failure spends one fail_call,
+ * so the same provider's next number is usually safer than a fresh
+ * provider's second call). A provider is excluded for this request after two
+ * failures in it; an uncounted failure (400/401/unreachable, which spends no
+ * budget) excludes that one (provider, model) pair. Returns the answer to
+ * send, or null when no free model could serve it.
  */
 async function serve(
   clientApi: 'openai' | 'anthropic',
@@ -337,30 +385,59 @@ async function serve(
   const stream = body.stream === true;
   const candidates = candidatesFor(probes, brief.ratings, requires, clientApi, jsonModeOf(body, clientApi));
   if (candidates.length === 0) return null;
-  for (const cand of candidates) {
-    const state = stateFor(cand.probe.provider.id);
-    if (state.dead) continue;
-    const result = await callUpstream(cand, clientApi, body, stream);
+  const best = bestRatingFor(candidates);
+  const failsThisRequest = new Map<string, number>();
+  const badPairs = new Set<string>();
+  for (;;) {
+    const lambda = lamEff();
+    let pick: { cand: Candidate; loss: number } | null = null;
+    let pickCost = Infinity;
+    for (const cand of candidates) {
+      const providerId = cand.probe.provider.id;
+      const state = stateFor(providerId);
+      if (state.dead) continue;
+      if ((failsThisRequest.get(providerId) ?? 0) >= 2) continue;
+      if (badPairs.has(`${providerId}/${cand.model.id}`)) continue;
+      const risk = riskOf(providerId, state.history, state.calls + 1);
+      const loss = currentRequestWeight * (best - cand.rating);
+      const over = Math.max(0, lossSoFar + loss - LOSS_PENALTY_AFTER);
+      const cost = lambda * risk + loss + LOSS_PENALTY_PER_MILLI * over;
+      if (cost < pickCost) {
+        pickCost = cost;
+        pick = { cand, loss };
+      }
+    }
+    if (pick === null) return null;
+    const providerId = pick.cand.probe.provider.id;
+    const state = stateFor(providerId);
+    const result = await callUpstream(pick.cand, clientApi, body, stream);
     if (result.ok) {
-      if (result.counted) state.calls += 1;
+      if (result.counted) {
+        state.calls += 1;
+        state.history.set(state.calls, true);
+      }
       state.consecutiveFailures = 0;
+      lossSoFar += pick.loss;
       return { status: 200, contentType: result.contentType, text: result.text };
     }
     if (result.counted) {
       state.calls += 1;
+      state.history.set(state.calls, false);
       state.consecutiveFailures += 1;
-      const max = CALLS_MAX[cand.probe.provider.id];
+      failuresSoFar += 1;
+      failsThisRequest.set(providerId, (failsThisRequest.get(providerId) ?? 0) + 1);
+      const max = CALLS_MAX[pick.cand.probe.provider.id];
       if (state.consecutiveFailures >= 2 || (max !== undefined && state.calls > max)) {
         state.dead = true;
-        log(`${cand.probe.provider.id} is dead after ${state.calls} calls`);
+        log(`${providerId} is dead after ${state.calls} calls`);
       } else {
-        log(`${cand.probe.provider.id}/${cand.model.id} refused HTTP ${result.status} (call ${state.calls})`);
+        log(`${providerId}/${pick.cand.model.id} refused HTTP ${result.status} (call ${state.calls})`);
       }
     } else {
-      log(`${cand.probe.provider.id}/${cand.model.id} failed without spending budget (HTTP ${result.status})`);
+      badPairs.add(`${providerId}/${pick.cand.model.id}`);
+      log(`${providerId}/${pick.cand.model.id} failed without spending budget (HTTP ${result.status})`);
     }
   }
-  return null;
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
