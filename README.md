@@ -12,26 +12,27 @@ node main.ts            # reads $MAKEFUN_PROMPT_FILE, registers with $MAKEFUN_EN
 node main.ts --list     # prints the catalog document and exits 0
 ```
 
-## How it routes (v2)
+## How it routes (v3)
 
 - Candidates are every free model meeting the request's requirements,
   ranked by the quality table's `rating_milli` (best first). A paid model is
   never a legal pick.
-- Attempts are priced, not rating-ordered: each candidate costs
-  `lamEff * P(its provider's next call refuses) + weighted rating loss`.
-  The refusal probability is the exact Bayesian posterior over the
-  generator's published prior (`lib/risk.ts` — budgets, 1–2 fail_calls in
-  `[2, budget-1]`, one designated second-call provider, one outage
-  provider), conditioned on the refusals and successes observed so far.
-  `lamEff` doubles with every failure already spent (capped at 4x); after
-  four failures the tie-break is lost and the router switches to quality
-  mode. A soft guard penalises accumulated weighted loss past 320 milli
-  (quality 99 needs at most 382). Costs are recomputed after every refusal.
+- The router is a model-predictive planner (`lib/planner.ts`), not a
+  per-request greedy. It builds a 20-slot plan by lowest chained Bayesian
+  refusal risk (first calls are free; every later call carries the exact
+  posterior over the generator's published prior — budgets, 1–2 fail_calls
+  in `[2, budget-1]`, one designated second-call provider, one outage
+  provider — conditioned on the successes and refusals observed so far),
+  then swaps slots until the min-loss assignment of the remaining requests
+  to the plan's slots is feasible and fits the loss cap. The plan is rebuilt
+  only after a failure; a success leaves it valid.
+- The loss cap is the key insight: score 99 needs quality ≥ 98, i.e.
+  weighted rating loss ≤ 676 milli over the trial, so loss below the cap is
+  free — the router spends it (cap 660) to buy safer calls instead of
+  milking the 1475-rated provider into its risky deep slots. See
+  `VALIDATION.md` for the numbers.
 - A provider is dead after two consecutive refusals, or a refusal past its
-  sealed budget ceiling (`calls_max`). The generator draws budgets from
-  `calls_min..calls_max` and fail_calls from `[2, budget-1]`, so a
-  provider's first call always succeeds and a refusal past `calls_max` is
-  certainly the budget spent. Dead providers are never retried.
+  sealed budget ceiling (`CALLS_MAX`). Dead providers are never retried.
 - An OpenAI JSON-mode request never routes to an Anthropic-wire provider:
   that wire cannot carry `response_format`.
 
@@ -50,15 +51,16 @@ parsed and the client compares that echo with what it sent.
 - `main.ts` — the server: brief, catalog probe, routes, register, poll, routing
 - `lib/providers.ts` — brief parsing, catalog probe, catalog building, candidates
 - `lib/risk.ts` — Bayesian per-call refusal risk over the generator's prior
+- `lib/planner.ts` — the slot planner: risk-first plan + feasibility/loss repair (min-cost flow)
 - `lib/wire.ts` — Anthropic ↔ OpenAI translation and SSE writers (starter's, kept)
 - `lib/translate.ts` — cross-wire parsing/rendering and request builders
 - `LICENSE` — MIT
 
 ## Scores (local kit trials)
 
-v2: **99/100** on all 3 practice trials (quality 99, served 100, wire 100,
-failover 100, catalog 100) with **23 / 21 / 23 upstream calls** (v1: 26 / 30 /
-29). Quality 99 is the structural ceiling: 17 of the 20 requests want the
-1475-rated model, but its provider's budget caps at 12 calls. The tie-break
-is upstream calls, so v2 trades a little rating (weighted loss 294 / 214 /
-311 of the 382 budget) for far fewer refused calls. See `VALIDATION.md`.
+v3: **99/100** on all 3 practice trials (quality 98, served 100, wire 100,
+failover 100, catalog 100) with **21 / 22 / 21 upstream calls** (v2: 23 / 21 /
+23; v1: 26 / 30 / 29). Quality 98 is by design: the planner spends loss up
+to its 660 cap (546 / 601 / 546) because loss below 676 still scores 99,
+and the saved calls are worth more than the quality point. The tie-break is
+upstream calls, so v3's mean 21.33 beats v2's 22.33. See `VALIDATION.md`.
