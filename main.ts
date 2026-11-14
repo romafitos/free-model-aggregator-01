@@ -1,4 +1,4 @@
- // free-model-aggregator-01: one server, two client wires, ten free providers.
+// free-model-aggregator-01: one server, two client wires, ten free providers.
 //
 // The server reads the brief, probes every provider's catalog route, builds
 // one catalog, registers it with the env, and serves the client's 20
